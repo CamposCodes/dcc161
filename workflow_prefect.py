@@ -2,21 +2,13 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from prefect import flow, task
 import pandas as pd
-from google.colab import drive
 import os
 import nest_asyncio
 from prefect.server.schemas.schedules import CronSchedule
 import asyncio
 import matplotlib.pyplot as plt
-from prefect.deployments import Deployment
-from prefect.infrastructure import Process
-from prefect.client import get_client
 from prefect.artifacts import create_table_artifact
 from prefect.blocks.system import Secret
-from prefect.variables import set_variable, get_variable
-
-# Conectar ao Google Drive
-drive.mount('/content/drive')
 
 # Definir variáveis de data e tickers
 end_date = datetime.now()
@@ -39,9 +31,6 @@ tickers = [
     "TOTS3.SA", "UGPA3.SA", "USIM5.SA", "VALE3.SA", "VBBR3.SA", "VIVT3.SA",
     "VVAR3.SA", "WEGE3.SA", "YDUQ3.SA"
 ]
-
-# Salvar a lista de tickers como variável Prefect
-set_variable("tickers", tickers)
 
 # Task para baixar dados
 @task(retries=3, retry_delay_seconds=10, log_prints=True)
@@ -69,7 +58,7 @@ def calculate_indicators(data):
 
 # Task para gerar relatórios simples em formato de gráficos
 @task(retries=3, retry_delay_seconds=10, log_prints=True)
-def generate_reports(data, folder_path='/content/drive/My Drive/stock_reports'):
+def generate_reports(data, folder_path='./reports'):
     os.makedirs(folder_path, exist_ok=True)
     for ticker, df in data.items():
         plt.figure(figsize=(10, 5))
@@ -82,9 +71,9 @@ def generate_reports(data, folder_path='/content/drive/My Drive/stock_reports'):
         plt.close()
         print(f"Relatório de {ticker} salvo em {report_path}")
 
-# Task para salvar o DataFrame no Google Drive e criar um link de artefato
+# Task para salvar o DataFrame localmente e criar um link de artefato
 @task(retries=3, retry_delay_seconds=10, log_prints=True)
-def upload_to_drive_and_create_link(data, folder_path='/content/drive/My Drive/stock_data'):
+def save_data_locally(data, folder_path='./data'):
     os.makedirs(folder_path, exist_ok=True)
     links = {}
     for ticker, df in data.items():
@@ -95,9 +84,9 @@ def upload_to_drive_and_create_link(data, folder_path='/content/drive/My Drive/s
         links[ticker] = file_path
 
         # Simulação de criação de link de artefato
-        create_link_artifact(
-            key=ticker.lower(),
-            link=file_path,
+        create_table_artifact(
+            key=ticker.lower().replace('.', '-'),
+            table=[{"link": file_path}],
             description=ticker + " stock_data",
         )
 
@@ -106,22 +95,32 @@ def upload_to_drive_and_create_link(data, folder_path='/content/drive/My Drive/s
 # Task para registrar as três ações que mais subiram e as três que mais desceram no último dia baixado
 @task(retries=3, retry_delay_seconds=10, log_prints=True)
 def record_top_movers(data):
-    last_day = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     changes = {}
     for ticker, df in data.items():
-        if last_day in df.index:
-            changes[ticker] = df.loc[last_day]['Close'] - df.loc[last_day]['Open']
+        try:
+            # Pegar a última data disponível para cada ticker
+            last_available_date = df.index[-1]
+            
+            # Calcular a variação usando valores escalares
+            daily_change = float(df.loc[last_available_date, 'Close']) - float(df.loc[last_available_date, 'Open'])
+            changes[ticker] = daily_change
+            
+        except (KeyError, IndexError, ValueError) as e:
+            print(f"Erro ao processar {ticker}: {e}")
+            continue
+    # Ordenar as mudanças
     sorted_changes = sorted(changes.items(), key=lambda x: x[1], reverse=True)
-    top_gainers = sorted_changes[:3]
-    top_losers = sorted_changes[-3:]
-
+    # Pegar top 3 e bottom 3
+    top_gainers = sorted_changes[:3] if len(sorted_changes) >= 3 else sorted_changes
+    top_losers = sorted_changes[-3:] if len(sorted_changes) >= 3 else sorted_changes[::-1]
+    # Preparar dados para o artifact
     table_data = {
         "Top Gainers": [f"{ticker}: {change:.2f}" for ticker, change in top_gainers],
         "Top Losers": [f"{ticker}: {change:.2f}" for ticker, change in top_losers]
     }
     create_table_artifact(
-        key="top_movers",
-        table=table_data,
+        key="top-movers",
+        table=[table_data],
         description="Top 3 gainers and losers"
     )
     print("Top movers registrados com sucesso")
@@ -129,11 +128,10 @@ def record_top_movers(data):
 # Criando o fluxo Prefect
 @flow(name="stock_workflow")
 def stock_workflow():
-    tickers = get_variable("tickers")
     data = download_stock_data(tickers, start_date, end_date)
     indicators = calculate_indicators(data)
     generate_reports(indicators)
-    artifact_links = upload_to_drive_and_create_link(indicators)
+    artifact_links = save_data_locally(indicators)
     record_top_movers(indicators)
     for ticker, link in artifact_links.items():
         print(f"Link para os dados de {ticker}: {link}")
@@ -141,29 +139,32 @@ def stock_workflow():
 # Habilitar nest_asyncio para permitir loops aninhados
 nest_asyncio.apply()
 
+# Função para criar o secret
+def create_secret():
+    # Criar o bloco
+    secret_block = Secret(value="pnu_K4QUT5G3tDDlEpepH3jVpdG9CV5LkT3erV5U")
+    
+    # Salvar com o nome específico
+    secret_block.save(name="prefect-cloud-api-key", overwrite=True)
+    print("Bloco Secret criado com sucesso!")
+
 # Função principal para execução
-async def main():
+def main():
+    # Criar o secret
+    create_secret()
+
     # Configurar Prefect Cloud
     secret_block = Secret.load("prefect-cloud-api-key")
-    os.system(f"prefect cloud login -k {secret_block.get()}")
-
-    # Fazer o deploy com CRON
-    deployment = Deployment.build_from_flow(
-        flow=stock_workflow,
-        name="stock-data-daily",
-        schedule=CronSchedule(cron="0 0 * * *"),  # Executa diariamente à meia-noite
-        infrastructure=Process(),
-        tags=["stocks", "daily"]
-    )
-    deployment.apply()
+    api_key = secret_block.get()
+    os.system(f"prefect cloud login -k {api_key}")
 
     # Executar o flow
-    await stock_workflow()
+    stock_workflow()
 
 # Bloco de execução
 if __name__ == "__main__":
     # Executar o programa
-    asyncio.run(main())
+    main()
 
-# Instale as dependencias
-!pip install -U prefect yfinance nest_asyncio matplotlib
+
+#cron adicionar e deploy
